@@ -2,8 +2,8 @@
 
 Kept in `utils` rather than `runner.run_support.config` so that tools which
 only score existing runs — `clawbench-rescore`, for one — can resolve a judge
-model without importing the runner, which probes for a container engine at
-import time and exits when Docker and Podman are both absent.
+model without pulling in the container-runner configuration at all. Reading a
+models file is a workspace concern, not a runner one.
 """
 
 from pathlib import Path
