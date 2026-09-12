@@ -447,11 +447,15 @@ def collect_run_rows(base_output: Path) -> list[dict[str, Any]]:
             if not run_dir.is_dir():
                 continue
             data = run_dir / "data"
-            if not data.exists():
+            meta_file = run_dir / "run-meta.json"
+            # A run that failed before the container started (API preflight)
+            # writes run-meta.json but never creates data/. It is still a run
+            # the batch attempted, so it must count toward the totals rather
+            # than vanish from the summary.
+            if not data.exists() and not meta_file.exists():
                 continue
 
             # Parse case and model from run-meta.json or dir name
-            meta_file = run_dir / "run-meta.json"
             if meta_file.exists():
                 meta = json.loads(meta_file.read_text())
                 case = meta.get("test_case", "?")

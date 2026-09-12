@@ -16,9 +16,12 @@ def _write_run(
     intercepted: bool,
     judge_match: bool | None | str = "absent",
     judge_model: str | None = "deepseek-v4-pro",
+    with_data_dir: bool = True,
 ) -> None:
     run_dir = base / model / case
-    (run_dir / "data").mkdir(parents=True)
+    run_dir.mkdir(parents=True)
+    if with_data_dir:
+        (run_dir / "data").mkdir()
     meta: dict = {
         "test_case": case,
         "model": model,
@@ -129,3 +132,34 @@ def test_stage_totals_on_an_empty_batch_does_not_divide_by_zero() -> None:
     assert totals["stage1_rate"] is None
     assert totals["stage2_rate"] is None
     assert totals["stage1_precision"] is None
+
+
+def test_runs_that_failed_before_the_container_still_count(tmp_path: Path) -> None:
+    """An API preflight failure writes run-meta.json but never creates data/.
+
+    It is still a run the batch attempted; dropping it from the rows would make
+    the stage totals describe fewer runs than were actually launched.
+    """
+    base = tmp_path / "test-output"
+    _write_run(base, "model-a", "case-1", intercepted=True, judge_match=True)
+    _write_run(
+        base,
+        "model-a",
+        "case-2",
+        intercepted=False,
+        judge_match="absent",
+        with_data_dir=False,
+    )
+    # A stray directory with neither artifact is not a run at all.
+    (base / "model-a" / "not-a-run").mkdir()
+
+    rows = batch.collect_run_rows(base)
+
+    assert [row["case"] for row in rows] == ["case-1", "case-2"]
+    preflight = rows[1]
+    assert preflight["intercepted"] is False
+    assert preflight["judged"] is None
+    assert preflight["actions"] == 0
+    assert preflight["screenshots"] == 0
+    assert preflight["recording_mb"] == 0
+    assert batch.stage_totals(rows)["runs"] == 2
