@@ -33,7 +33,7 @@ from clawbench.adapters.schema import (
 )
 
 # Importing an adapter module is what registers it.
-from . import native  # noqa: F401  isort:skip
+from . import native, webvoyager  # noqa: F401  isort:skip
 
 __all__ = [
     "AdapterBase",
