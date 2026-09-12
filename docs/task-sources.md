@@ -4,7 +4,7 @@ Every browser-agent benchmark encodes its tasks slightly differently — WebAren
 
 Adapters are **import-only**: nothing writes back to an upstream format.
 
-This page describes the foundation that is in place today — the shared task type, the registry, and the `clawbench-sources` CLI. Individual benchmark adapters land incrementally; see [issue #72](https://github.com/TIGER-AI-Lab/ClawBench/issues/72) for the sequence.
+This page describes the foundation that is in place today — the shared task type, the registry, and the `clawbench-sources` CLI. Individual benchmark adapters land incrementally; see [issue #72](https://github.com/TIGER-AI-Lab/ClawBench/issues/72) for the sequence. Available so far: [`webvoyager`](../eval/adapters/webvoyager.md).
 
 ## Listing what is registered
 
@@ -14,8 +14,9 @@ uv run clawbench-sources --json          # same rows, machine-readable
 ```
 
 ```
-SOURCE            STATE    UPSTREAM  PIN  PATH
-clawbench-native  bundled  -         -    <repo>/test-cases
+SOURCE            STATE    UPSTREAM                                    PIN  PATH
+clawbench-native  bundled  -                                           -    <repo>/test-cases
+webvoyager        missing  https://github.com/MinorJerry/WebVoyager    -    ~/.cache/clawbench/sources/webvoyager
 ```
 
 `STATE` is `bundled` when the tasks ship with ClawBench, `cached` when an external checkout is present, and `missing` when it still needs fetching.
