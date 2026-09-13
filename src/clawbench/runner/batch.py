@@ -7,35 +7,29 @@ import itertools
 import json
 import os
 import re
-import shutil
 import signal
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import yaml
 
+from clawbench.runner.run_support.config import engine
 from clawbench.utils.paths import ASSET_ROOT, WORKSPACE_ROOT, ensure_workspace_templates
+from clawbench.utils.timeouts import (
+    BATCH_JOB_GRACE_S,
+    DEFAULT_TIME_LIMIT_S,
+    JOB_KILL_GRACE_S,
+)
 
 
-def detect_engine() -> str:
-    env = os.environ.get("CONTAINER_ENGINE", "").strip().lower()
-    if env:
-        if env not in ("docker", "podman"):
-            print(f"ERROR: CONTAINER_ENGINE must be 'docker' or 'podman', got '{env}'")
-            sys.exit(1)
-        if not shutil.which(env):
-            print(f"ERROR: CONTAINER_ENGINE={env} but '{env}' not found on PATH")
-            sys.exit(1)
-        return env
-    for cmd in ("docker", "podman"):
-        if shutil.which(cmd):
-            return cmd
-    print("ERROR: Neither 'docker' nor 'podman' found on PATH")
-    sys.exit(1)
+# Re-exported under its historical name. The body used to be a third copy of
+# the same PATH probe; it is config.engine() now that importing config no
+# longer costs a container-engine probe.
+detect_engine = engine
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +97,69 @@ def _resolve_cases_dir(cases_dir: str | Path) -> Path:
                 return candidate
         path = WORKSPACE_ROOT / path
     return path
+
+
+def job_timeout_s(
+    case_dir: Path, override_minutes: float | None = None
+) -> float | None:
+    """Wall-clock bound for one job, or None when the user disabled it."""
+    if override_minutes is not None:
+        return None if override_minutes <= 0 else override_minutes * 60
+
+    task_file = case_dir if case_dir.is_file() else case_dir / "task.json"
+    limit_s = DEFAULT_TIME_LIMIT_S
+    try:
+        task = json.loads(task_file.read_text(encoding="utf-8"))
+        limit_s = int(float(task["time_limit"]) * 60)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return limit_s + BATCH_JOB_GRACE_S
+
+
+class _Stoppable(Protocol):
+    """The part of asyncio.subprocess.Process that stop_wedged_job uses.
+
+    Narrow enough that a test can stand in a stub run which honours only
+    the signals it chooses, which is how the SIGTERM-then-SIGKILL sequence
+    is made observable without a real container.
+    """
+
+    @property
+    def pid(self) -> int: ...
+
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]: ...
+
+
+async def stop_wedged_job(
+    proc: _Stoppable, grace_s: float = JOB_KILL_GRACE_S
+) -> tuple[bytes, bool]:
+    """Stop a job that blew through its bound. Returns (output, escalated).
+
+    SIGTERM first. clawbench-run installs a SIGTERM handler that raises
+    KeyboardInterrupt and unwinds through `finally: docker_rm(container)`
+    (run.py), so the container it started actually goes away. SIGKILL cannot
+    be caught: it reaps the Python child while the container keeps running
+    under the engine daemon, holding the CPU and memory this bound exists to
+    reclaim and leaving one stale container behind per timed-out job.
+
+    Escalates to SIGKILL only if the child is still alive after `grace_s`; a
+    run wedged badly enough to ignore SIGTERM must not hold its slot open.
+    The second element reports whether that escalation happened, so callers
+    can log what actually occurred instead of claiming a clean teardown.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, OSError):
+            # The group is already gone, so clawbench-run reached the end of
+            # its own cleanup; nothing was escalated past SIGTERM.
+            return b"", False
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=grace_s)
+            return stdout or b"", sig is signal.SIGKILL
+        except (asyncio.TimeoutError, ProcessLookupError, OSError):
+            continue
+    return b"", True
 
 
 def _all_cases_in(base: Path) -> list[Path]:
@@ -239,6 +296,7 @@ async def run_job(
     browser_runtime_options: str | None = None,
     judge: str | None = None,
     no_judge: bool = False,
+    job_timeout: float | None = None,
 ) -> None:
     assert shutdown_event is not None
     try:
@@ -303,17 +361,50 @@ async def run_job(
                 )
                 job.proc = proc
                 running_procs.append(proc)
+                bound = job_timeout_s(job.case_dir, job_timeout)
+                host_timed_out = False
+                killed_hard = False
                 try:
-                    stdout, _ = await proc.communicate()
+                    stdout, _ = await asyncio.wait_for(
+                        proc.communicate(), timeout=bound
+                    )
+                except asyncio.TimeoutError:
+                    # The child is wedged past even its own host-side
+                    # deadline. Signal it down through its own cleanup and
+                    # keep the batch moving; stop_wedged_job explains why
+                    # this is not a SIGKILL.
+                    host_timed_out = True
+                    print(
+                        f"[{ts()}] HOST TIMEOUT {job.case_name} ({job.model}) "
+                        f"after {int(bound or 0)}s — stopping"
+                    )
+                    stdout, killed_hard = await stop_wedged_job(proc)
                 finally:
                     if proc in running_procs:
                         running_procs.remove(proc)
                     job.proc = None
 
                 job.duration = time.monotonic() - start
+                if host_timed_out:
+                    if killed_hard:
+                        # Say so plainly: SIGKILL skipped clawbench-run's
+                        # own cleanup, so its container may still be up.
+                        detail = (
+                            f"SIGTERM ignored for {int(JOB_KILL_GRACE_S)}s, "
+                            "escalated to SIGKILL; a container may have "
+                            "survived this job"
+                        )
+                    else:
+                        detail = "SIGTERM sent; clawbench-run cleaned up"
+                    marker = (
+                        f"\nbatch.py: host_timeout after {int(bound or 0)}s; {detail}\n"
+                    )
+                    stdout = (stdout or b"") + marker.encode()
                 log_path.write_bytes(stdout or b"")
 
-                if proc.returncode == 0:
+                if host_timed_out:
+                    job.status = "error"
+                elif proc.returncode == 0:
                     job.status = "passed"
                 elif proc.returncode == 1:
                     job.status = "failed"
@@ -739,10 +830,10 @@ async def async_main(args: argparse.Namespace) -> int:
     # Build image once — reuse run.py's spinner/progress helper so first-time
     # builds show a clear banner and live step counter instead of a wall of
     # apt/npm output.
-    engine = detect_engine()
+    resolved_engine = detect_engine()
     # Ensure child run.py processes (and the imported helper below) use the
     # same engine as we just detected.
-    os.environ["CONTAINER_ENGINE"] = engine
+    os.environ["CONTAINER_ENGINE"] = resolved_engine
     from clawbench.runner import run as _run_mod
 
     _run_mod.docker_build(args.harness)
@@ -838,6 +929,7 @@ async def async_main(args: argparse.Namespace) -> int:
                 browser_runtime_options=getattr(args, "browser_runtime_options", None),
                 judge=args.judge,
                 no_judge=args.no_judge,
+                job_timeout=args.job_timeout,
             )
         )
         for j in jobs
@@ -931,6 +1023,13 @@ def main() -> None:
         help="Max parallel jobs (default: 1 for managed runtimes, otherwise 2)",
     )
     p.add_argument("--output-dir", default="test-output", help="Base output directory")
+    p.add_argument(
+        "--job-timeout",
+        type=float,
+        default=None,
+        help="Per-job wall-clock limit in minutes. Default: the case's own "
+        "time_limit plus head-room for pull/copy/judge. 0 disables the bound.",
+    )
     p.add_argument(
         "--stagger-delay",
         type=float,

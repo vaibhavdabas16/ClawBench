@@ -17,11 +17,11 @@ from typing import Any
 from clawbench.runner.run_support.config import (
     BASE_IMAGE,
     DEFAULT_HARNESS,
-    ENGINE,
     HARNESSES,
     IMAGE,
     WORKSPACE_ROOT,
     ModelConfigError,
+    engine,
     harness_image,
     load_model_config,
     load_runtime_env,
@@ -51,6 +51,7 @@ from clawbench.runner.run_support.docker import (
     step,
 )
 from clawbench.runner.run_support.email import create_email, delete_email
+from clawbench.utils.timeouts import HOST_TIMEOUT_GRACE_S
 from clawbench.runner.run_support.metadata import make_run_meta, write_run_meta
 from clawbench.runner.run_support.results import (
     classify_run,
@@ -70,7 +71,6 @@ from clawbench.utils.paths import SHARED_ROOT, ensure_workspace_templates
 __all__ = [
     "BASE_IMAGE",
     "DEFAULT_HARNESS",
-    "ENGINE",
     "HARNESSES",
     "IMAGE",
     "docker_build",
@@ -167,6 +167,10 @@ def main():
     if not args.human and args.model is None:
         parser.error("model is required for agent mode (or use --human)")
 
+    # Even --no-build needs a container; reject missing engines before allocating
+    # email or browser resources. Keep this after parsing so --help remains usable.
+    engine()
+
     # Load infrastructure config. Process environment has final precedence.
     env = load_runtime_env()
     infra_required = ["PURELY_MAIL_API_KEY", "PURELY_MAIL_DOMAIN"]
@@ -250,6 +254,7 @@ def main():
     time_limit_s = 1800
     extra_info_warnings: list[str] = []
     intercepted = False
+    host_timeout_reason: str | None = None
     host_port: int | None = None
     judge_cfg: dict | None = startup_judge_cfg
     personal_info_metadata: dict[str, Any] | None = None
@@ -510,7 +515,7 @@ def main():
             def handle_sigint(sig, frame):
                 print("\nCtrl+C received, stopping container gracefully...")
                 subprocess.run(
-                    [ENGINE, "stop", "-t", "20", container], capture_output=True
+                    [engine(), "stop", "-t", "20", container], capture_output=True
                 )
 
             signal.signal(signal.SIGINT, handle_sigint)
@@ -579,11 +584,21 @@ def main():
             step(f"Agent running (max {task['time_limit']}min)")
 
         phase = "waiting_for_container"
-        docker_wait(
+        # Host-side backstop: the in-container watchdog gets time_limit_s to
+        # stop the agent; if it never fires we kill the container ourselves
+        # rather than blocking forever. --human runs are unbounded by design.
+        host_timed_out = docker_wait(
             container,
             model_cfg=None if args.human else model_cfg,
             harness=None if args.human else args.harness,
+            timeout_s=None if args.human else time_limit_s + HOST_TIMEOUT_GRACE_S,
         )
+        if host_timed_out:
+            host_timeout_reason = (
+                f"host_timeout: container did not exit within "
+                f"{time_limit_s + HOST_TIMEOUT_GRACE_S}s"
+            )
+            print(f"WARNING: {host_timeout_reason}")
 
         phase = "container_logs"
         step("Container logs")
@@ -669,6 +684,10 @@ def main():
         classification = classify_run(
             output_dir,
             intercepted,
+            # A killed container is an infra failure, not the model's fault, so
+            # it stays out of adjusted scoring. The specific cause goes in
+            # failure_reason, matching "infra_failure: ..." elsewhere here.
+            "infra_failure" if host_timeout_reason else None,
             model_cfg=model_cfg,
             recording_required=_recording_required(),
         )
@@ -693,6 +712,7 @@ def main():
             classification=classification,
             browser_runtime=_browser_runtime_meta(),
             extra_info_warnings=extra_info_warnings,
+            failure_reason=host_timeout_reason,
         )
         if judge_result is not None:
             meta["judge"] = judge_result
