@@ -292,15 +292,26 @@ def is_infra_class_failure(meta: dict) -> bool:
 
 
 def recorded_outcome(meta: dict) -> tuple[str, float]:
-    """Batch job status and duration for a run that already happened."""
+    """Batch job status and duration for a run that already happened.
+
+    Mirrors the exit-code map a live job goes through: run-meta's `pass` is
+    exactly what run.py exits 0 on (stage 1 and, unless --no-judge, stage 2),
+    and a judge that never rendered a verdict is exit 3, not a failure.
+    """
     try:
         duration = float(meta.get("duration_seconds") or 0)
     except (TypeError, ValueError):
         duration = 0.0
-    if meta.get("intercepted"):
+    passed = meta.get("pass")
+    if passed is None:
+        # Pre-judge run-meta: stage 1 was the whole verdict.
+        passed = meta.get("intercepted")
+    if passed:
         return "passed", duration
     if is_infra_class_failure(meta):
         return "error", duration
+    if meta.get("intercepted") and "judge" in meta and meta.get("judge_match") is None:
+        return "judge_inconclusive", duration
     return "failed", duration
 
 

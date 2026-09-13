@@ -44,26 +44,32 @@ def _record_run(
     intercepted: bool = False,
     failure_category: str | None = None,
     infra_failure: bool = False,
+    judge_match: bool | None | str = "unjudged",
     duration: int = 90,
     stamp: str = "20260101-000000",
 ) -> Path:
-    """Write a run-meta.json where a real run would put one."""
+    """Write a run-meta.json where a real run would put one.
+
+    `judge_match` mirrors run.py: leave it "unjudged" for a --no-judge run,
+    otherwise pass the judge's verdict (None = it never rendered one).
+    """
     run_dir = base / _safe(model) / f"claw-code-{case}-{_safe(model)}-{stamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "run-meta.json").write_text(
-        json.dumps(
-            {
-                "test_case": case,
-                "model": model,
-                "timestamp": stamp,
-                "duration_seconds": duration,
-                "intercepted": intercepted,
-                "result_category": "intercepted" if intercepted else failure_category,
-                "failure_category": failure_category,
-                "infra_failure": infra_failure,
-            }
-        )
-    )
+    meta: dict = {
+        "test_case": case,
+        "model": model,
+        "timestamp": stamp,
+        "duration_seconds": duration,
+        "intercepted": intercepted,
+        "result_category": "intercepted" if intercepted else failure_category,
+        "failure_category": failure_category,
+        "infra_failure": infra_failure,
+        "pass": intercepted and judge_match in ("unjudged", True),
+    }
+    if judge_match != "unjudged":
+        meta["judge"] = {"match": judge_match, "reason": ""}
+        meta["judge_match"] = judge_match
+    (run_dir / "run-meta.json").write_text(json.dumps(meta))
     return run_dir
 
 
@@ -125,7 +131,13 @@ def test_the_written_summary_preserves_carried_over_totals(tmp_path: Path) -> No
     write_summary_json(jobs, tmp_path, 12.0, 2, "2026-01-01T00:00:00+00:00")
     summary = json.loads((tmp_path / "batch-summary.json").read_text())
 
-    assert summary["totals"] == {"passed": 1, "failed": 1, "error": 0, "skipped": 0}
+    assert summary["totals"] == {
+        "passed": 1,
+        "failed": 1,
+        "error": 0,
+        "judge_inconclusive": 0,
+        "skipped": 0,
+    }
     assert [j["duration_seconds"] for j in summary["jobs"]] == [214, 90]
     assert all(j["resumed"] for j in summary["jobs"])
 
@@ -137,15 +149,37 @@ def test_the_written_summary_preserves_carried_over_totals(tmp_path: Path) -> No
     "meta, expected",
     [
         ({"intercepted": True}, "passed"),
+        ({"intercepted": True, "pass": True}, "passed"),
         ({"intercepted": False, "failure_category": "model_not_intercepted"}, "failed"),
         ({"intercepted": False, "infra_failure": True}, "error"),
         ({"intercepted": False, "failure_category": "api_or_credit"}, "error"),
+        # Stage 2 verdicts, as run.py exits them: mismatch is 1, no verdict is 3.
+        (
+            {"intercepted": True, "pass": False, "judge": {}, "judge_match": False},
+            "failed",
+        ),
+        (
+            {"intercepted": True, "pass": False, "judge": {}, "judge_match": None},
+            "judge_inconclusive",
+        ),
     ],
 )
 def test_recorded_outcome_maps_a_run_to_a_batch_status(
     meta: dict, expected: str
 ) -> None:
     assert recorded_outcome(meta)[0] == expected
+
+
+def test_a_judge_outage_resumes_as_inconclusive_not_passed(tmp_path: Path) -> None:
+    """Stage 1 succeeded but the judge never answered. Live, batch files that
+    under judge_inconclusive; a resume must not upgrade it to a pass."""
+    _record_run(tmp_path, "002-food", "glm-5.1", intercepted=True, judge_match=None)
+    _record_run(tmp_path, "003-mail", "glm-5.1", intercepted=True, judge_match=False)
+    jobs = [_job("002-food", "glm-5.1"), _job("003-mail", "glm-5.1")]
+
+    apply_resume(jobs, tmp_path)
+
+    assert [j.status for j in jobs] == ["judge_inconclusive", "failed"]
 
 
 def test_a_missing_or_unparsable_duration_does_not_crash_resume() -> None:
